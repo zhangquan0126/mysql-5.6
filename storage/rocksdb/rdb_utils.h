@@ -270,7 +270,8 @@ const char *rdb_check_next_token(const struct charset_info_st *const cs,
     MY_ATTRIBUTE((__nonnull__, __warn_unused_result__));
 
 const char *rdb_parse_id(const struct charset_info_st *const cs,
-                         const char *str, std::string *const id)
+                         const char *str, std::string *const id,
+                         const bool &contain_dot = false)
     MY_ATTRIBUTE((__nonnull__(1, 2), __warn_unused_result__));
 
 const char *rdb_skip_id(const struct charset_info_st *const cs, const char *str)

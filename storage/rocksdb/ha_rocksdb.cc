@@ -31,7 +31,7 @@
 #include <set>
 #include <string>
 #include <vector>
-
+#include <list>
 /* MySQL includes */
 #include "./debug_sync.h"
 #include "./my_bit.h"
@@ -107,6 +107,9 @@ static st_io_stall_stats io_stall_stats;
 
 const std::string DEFAULT_CF_NAME("default");
 const std::string DEFAULT_SYSTEM_CF_NAME("__system__");
+// 2018/06/11 Quan Zhang Create a new column family for foreign key
+const std::string DEFAULT_FK_CF_NAME("__fk__");
+
 const std::string PER_INDEX_CF_NAME("$per_index_cf");
 
 class Rdb_explicit_snapshot;
@@ -2630,10 +2633,12 @@ public:
   }
 
   void acquire_snapshot(bool acquire_now) override {
-    auto thd_ss = std::static_pointer_cast<Rdb_explicit_snapshot>(
-        m_thd->get_explicit_snapshot());
-    if (thd_ss) {
-      m_explicit_snapshot = thd_ss;
+    if (m_thd != nullptr) {
+      auto thd_ss = std::static_pointer_cast<Rdb_explicit_snapshot>(
+          m_thd->get_explicit_snapshot());
+      if (thd_ss) {
+        m_explicit_snapshot = thd_ss;
+      }
     }
     if (m_read_opts.snapshot == nullptr) {
       if (m_explicit_snapshot) {
@@ -4432,8 +4437,10 @@ static int rocksdb_init_func(void *const p) {
   rocksdb_hton->update_table_stats = rocksdb_update_table_stats;
   rocksdb_hton->flush_logs = rocksdb_flush_wal;
 
+  // 2018/06/07 Quan Zhang Support Foreign Key
   rocksdb_hton->flags = HTON_TEMPORARY_NOT_SUPPORTED |
-                        HTON_SUPPORTS_EXTENDED_KEYS | HTON_CAN_RECREATE;
+                        HTON_SUPPORTS_EXTENDED_KEYS |
+                        HTON_SUPPORTS_FOREIGN_KEYS;
 
   DBUG_ASSERT(!mysqld_embedded);
 
@@ -5330,6 +5337,21 @@ ha_rocksdb::ha_rocksdb(my_core::handlerton *const hton,
       m_row_checksums_checked(0), m_in_rpl_delete_rows(false),
       m_in_rpl_update_rows(false), m_force_skip_unique_check(false) {}
 
+ha_rocksdb::ha_rocksdb(const ha_rocksdb& other)
+    : handler(other), m_table_handler(nullptr), m_scan_it(nullptr),
+      m_scan_it_skips_bloom(false), m_scan_it_snapshot(nullptr),
+      m_scan_it_lower_bound(nullptr), m_scan_it_upper_bound(nullptr),
+      m_tbl_def(nullptr), m_pk_descr(nullptr), m_key_descr_arr(nullptr),
+      m_pk_can_be_decoded(false), m_maybe_unpack_info(false),
+      m_pk_tuple(nullptr), m_pk_packed_tuple(nullptr),
+      m_sk_packed_tuple(nullptr), m_end_key_packed_tuple(nullptr),
+      m_sk_match_prefix(nullptr), m_sk_match_prefix_buf(nullptr),
+      m_sk_packed_tuple_old(nullptr), m_dup_sk_packed_tuple(nullptr),
+      m_dup_sk_packed_tuple_old(nullptr), m_pack_buffer(nullptr),
+      m_lock_rows(RDB_LOCK_NONE), m_keyread_only(FALSE), m_encoder_arr(nullptr),
+      m_row_checksums_checked(0), m_in_rpl_delete_rows(false),
+      m_in_rpl_update_rows(false), m_force_skip_unique_check(false) {}
+
 static const char *ha_rocksdb_exts[] = {NullS};
 
 const char **ha_rocksdb::bas_ext() const {
@@ -5340,6 +5362,14 @@ const char **ha_rocksdb::bas_ext() const {
 
 const std::string &ha_rocksdb::get_table_basename() const {
   return m_tbl_def->base_tablename();
+}
+
+void ha_rocksdb::set_pk_packed_tuple(const char *data, const std::size_t data_len) {
+  memcpy(m_pk_packed_tuple, data, data_len);
+}
+
+void ha_rocksdb::set_sk_packed_tuple(const char *data, const std::size_t data_len) {
+  memcpy(m_sk_packed_tuple, data, data_len);
 }
 
 /**
@@ -6288,6 +6318,8 @@ int ha_rocksdb::open(const char *const name, int mode, uint test_if_locked) {
   m_io_perf.init(&m_table_handler->m_table_perf_context,
                  &m_table_handler->m_io_perf_read,
                  &m_table_handler->m_io_perf_write, &stats);
+  m_table_handler->m_table = table;
+
   Rdb_perf_context_guard guard(&m_io_perf,
                                rocksdb_perf_context_level(ha_thd()));
 
@@ -7024,7 +7056,33 @@ int ha_rocksdb::create_key_def(const TABLE *const table_arg, const uint &i,
                                                      Rdb_key_def::TTL_FLAG)
           : UINT_MAX;
 
-  const char *const key_name = get_key_name(i, table_arg, m_tbl_def);
+  const char * key_name = get_key_name(i, table_arg, m_tbl_def);
+  std::string cur_name;
+
+  if (std::string(key_name) != "PRIMARY" && std::string(key_name) != "HIDDEN_PK_ID") {
+    KEY *key_info = &table_arg->key_info[i];
+    //handle multiple secondary key:
+    KEY_PART_INFO key_part = key_info->key_part[0];
+    cur_name = std::string(key_part.field->field_name);
+
+    for(uint i = 1; i < key_info->actual_key_parts - 1; i++){
+      cur_name = cur_name + "," + key_info->key_part[i].field->field_name;
+    }
+    key_name = cur_name.c_str();
+  }
+
+  if (std::string(key_name) == "PRIMARY") {
+    KEY *key_info = &table_arg->key_info[i];
+    //handle multiple primay key:
+    KEY_PART_INFO key_part = key_info->key_part[0];
+    cur_name = std::string(key_part.field->field_name);
+    
+    for(uint i = 1; i < key_info->actual_key_parts; i++){
+      cur_name = cur_name + "," + key_info->key_part[i].field->field_name;
+    }
+    key_name = cur_name.c_str();
+  }
+
   *new_key_def = std::make_shared<Rdb_key_def>(
       index_id, i, cf_info.cf_handle, index_dict_version, index_type,
       kv_version, cf_info.is_reverse_cf, cf_info.is_per_partition_cf, key_name,
@@ -7053,6 +7111,57 @@ int rdb_normalize_tablename(const std::string &tablename,
   *strbuf = tablename.substr(2, pos - 2) + "." + tablename.substr(pos + 1);
 
   return HA_EXIT_SUCCESS;
+}
+
+/*
+  Check to see if the user's original statmen includes drop foreign key
+*/
+bool ha_rocksdb::drop_foreign_key(THD *const thd, std::set<std::string> &fk_set, std::string &table_name){
+  bool success;
+  const char *str = thd_query_string(thd)->str;
+  bool valid_drop = false;
+
+  DBUG_ASSERT(str != nullptr);
+  str = rdb_find_in_string(str, "TABLE", &success);
+  if(!success){
+    return false;
+  }
+  str = rdb_check_next_token(&my_charset_bin, str, "TABLE", &success);
+  rdb_parse_id(&my_charset_bin, str, &table_name);
+  str = rdb_check_next_token(&my_charset_bin, str, table_name.c_str(), &success);
+  DBUG_ASSERT(success);
+
+  while (*str != '\0') {
+    //Scan from our current pos looking for 'DROP'
+    str = rdb_find_in_string(str, "DROP", &success);
+    if(!success) {
+      return false;
+    }
+    str = rdb_check_next_token(&my_charset_bin, str, "DROP", &success);
+    DBUG_ASSERT(success);
+
+    if (!my_isspace(&my_charset_bin, *str)) {
+      return false;
+    }
+
+    str = rdb_check_next_token(&my_charset_bin, str, "FOREIGN", &success);
+    DBUG_ASSERT(success);
+    if (!my_isspace(&my_charset_bin, *str)) {
+      return false;
+    }
+    str = rdb_check_next_token(&my_charset_bin, str, "KEY", &success);
+    if (!success) {
+      break;
+    }
+    std::string constraint_name;
+    rdb_parse_id(&my_charset_bin, str, &constraint_name);
+    str = rdb_check_next_token(&my_charset_bin, str, constraint_name.c_str(), &success);
+    DBUG_ASSERT(success);
+
+    fk_set.insert(constraint_name);
+    valid_drop = true;
+  }
+  return valid_drop;
 }
 
 /*
@@ -7234,10 +7343,16 @@ int ha_rocksdb::create(const char *const name, TABLE *const table_arg,
     DBUG_RETURN(err);
   }
 
+  bool has_foreign_key = false;
+  bool has_drop_foreign_key = false;
+  std::string table_name;
   if (contains_foreign_key(thd)) {
-    my_error(ER_NOT_SUPPORTED_YET, MYF(0),
-             "FOREIGN KEY for the RocksDB storage engine");
-    DBUG_RETURN(HA_ERR_UNSUPPORTED);
+    has_foreign_key = true;
+  }
+
+  std::set<std::string> fk_set;
+  if (drop_foreign_key(thd, fk_set, table_name)) {
+    has_drop_foreign_key = true;
   }
 
   const std::unique_ptr<rocksdb::WriteBatch> wb = dict_manager.begin();
@@ -7282,14 +7397,295 @@ int ha_rocksdb::create(const char *const name, TABLE *const table_arg,
   }
 
   dict_manager.lock();
+  if (has_drop_foreign_key) {
+    //get all foreign key defs base on table name
+    std::string prev_full_table_name = m_tbl_def->base_dbname() + "." + table_name;
+    auto prev_tdef = ddl_manager.find(prev_full_table_name);
+    if(prev_tdef == nullptr) {
+      //it should be "cannot drop constraint"
+      err = HA_ERR_CANNOT_ADD_FOREIGN;
+      dict_manager.unlock();
+      goto error;
+    }
+    Rdb_fk_set prev_foreign_descr_set = prev_tdef->m_foreign_descr_set;
+    Rdb_fk_set prev_referenced_descr_set = prev_tdef->m_referenced_descr_set;
+
+    for (auto iter = fk_set.begin(); iter != fk_set.end(); ++iter) {
+      std::string target_name = *iter;
+      for (auto it = prev_foreign_descr_set.begin(); it != prev_foreign_descr_set.end(); ++it) {
+        Rdb_fk_def fk_def;
+        if (it->id != target_name) {
+          fk_def = *it;
+          m_tbl_def->m_foreign_descr_set.insert(fk_def);
+          m_tbl_def->m_foreign_descr_set.insert(fk_def);
+        } else {
+          //delete referenced table's referenced_descr_set
+          std::string referenced_drop_table_name = ddl_manager.safe_get_table_name(it->m_referenced_gl_index_id);
+          auto referenced_drop_tdef = ddl_manager.find(referenced_drop_table_name);
+          DBUG_ASSERT(referenced_drop_tdef != nullptr);
+          referenced_drop_tdef->m_referenced_descr_set.erase(*it);
+        }
+      }
+    }
+  }
+  
+  if (has_foreign_key) {
+    bool success;
+    const char *str = thd_query_string(thd)->str;
+    
+    DBUG_ASSERT(str != nullptr);
+
+    while (*str != '\0') {
+      Rdb_fk_def fk_def;
+      bool has_constraint;
+      const char *constraint_str = rdb_find_in_string(str, "CONSTRAINT", &has_constraint);
+      if (has_constraint) {
+        const char *foreign_str = rdb_find_in_string(str, "FOREIGN", &success);
+        if (!success) {
+          break;
+        }
+        std::string constraint_string = constraint_str;
+        std::string foreign_string = foreign_str;
+        if (constraint_string.length() > foreign_string.length()) {
+          str = rdb_find_in_string(str, "CONSTRAINT", &success);
+          str = rdb_check_next_token(&my_charset_bin, str, "CONSTRAINT", &success);
+          DBUG_ASSERT(success);
+          std::string fk_name;
+          rdb_parse_id(&my_charset_bin, str, &fk_name);
+
+          fk_def.id = fk_name;
+          //if it is not unique, then break
+          if (dict_manager.get_fk_id(fk_name)==true) {
+            //ddl_manager.remove(m_tbl_def,batch, true);
+            err = HA_ERR_CANNOT_ADD_FOREIGN;
+            dict_manager.unlock();
+            goto error;
+          }
+        }
+      }
+      // Scan from our current pos looking for 'FOREIGN'
+      str = rdb_find_in_string(str, "FOREIGN", &success);
+      if (!success) {
+        break;
+      }
+
+      // Skip past the found "FOREIGN'
+      str = rdb_check_next_token(&my_charset_bin, str, "FOREIGN", &success);
+      DBUG_ASSERT(success);
+
+      if (!my_isspace(&my_charset_bin, *str)) {
+        continue;
+      }
+
+      // See if the next token is 'KEY'
+      str = rdb_check_next_token(&my_charset_bin, str, "KEY", &success);
+      if (!success) {
+        break;
+      }
+
+      // See if the next token is '('
+      str = rdb_check_next_token(&my_charset_bin, str, "(", &success);
+      if (!success) {
+        // There is an optional index id after 'FOREIGN KEY', skip it
+        str = rdb_skip_id(&my_charset_bin, str);
+
+        // Now check for '(' again
+        str = rdb_check_next_token(&my_charset_bin, str, "(", &success);
+
+        if (!success) {
+          continue;
+        }
+      }
+
+      // TODO: handle multple foreign key columns
+      
+      std::string col_name;
+      rdb_parse_id(&my_charset_bin, str, &col_name, true/*contain_comma*/);
+      str = rdb_check_next_token(&my_charset_bin, str, col_name.c_str(),
+                                 &success);
+      DBUG_ASSERT(success);
+
+      /*while(success) {
+        str = rdb_check_next_token(&my_charset_bin, str, ",", &success);
+        if(!success) {
+          break;
+        }
+        std::string cur_col_name;
+        rdb_parse_id(&my_charset_bin, str, &cur_col_name);
+        str = rdb_check_next_token(&my_charset_bin, str, cur_col_name.c_str(),
+                                 &success);
+        if(!success) {
+          break;
+        }
+        col_name = col_name + ", " + cur_col_name;
+      }*/
+      
+      bool found = m_tbl_def->find_key_gl_index_by_name(
+          col_name, fk_def.m_foreign_gl_index_id);
+      if (!found) {
+
+        err = HA_ERR_CANNOT_ADD_FOREIGN;
+        dict_manager.unlock();
+        goto error;
+      }
+      str = rdb_check_next_token(&my_charset_bin, str, ")", &success);
+      if (!success) {
+        continue;
+      }
+
+      // See if the next token is 'REFERENCES'
+      str = rdb_check_next_token(&my_charset_bin, str, "REFERENCES", &success);
+      if (!success) {
+        continue;
+      }
+
+      std::string referenced_table_name;
+      rdb_parse_id(&my_charset_bin, str, &referenced_table_name);
+      std::string full_referenced_table_name = m_tbl_def->base_dbname() + "." + referenced_table_name;
+      auto referenced_tdef = ddl_manager.find(full_referenced_table_name);
+
+      std::string constraint_name_by_default =
+          m_tbl_def->full_tablename() + "_" + full_referenced_table_name;
+      //std::unordered_map<std::string, int> counter;
+
+      str = rdb_check_next_token(&my_charset_bin, str, referenced_table_name.c_str(), &success);
+      DBUG_ASSERT(success);
+
+      str = rdb_check_next_token(&my_charset_bin, str, "(", &success);
+      if (!success) {
+        continue;
+      }
+
+      std::string ref_col_name;
+      //calcualte how many columns as fk;
+      rdb_parse_id(&my_charset_bin, str, &ref_col_name, true/*contain_comma*/);
+      str = rdb_check_next_token(&my_charset_bin, str, ref_col_name.c_str(),
+                                 &success);
+      DBUG_ASSERT(success);
+      /*while(success) {
+        str = rdb_check_next_token(&my_charset_bin, str, ",", &success);
+        if(!success) {
+          break;
+        }
+        std::string cur_ref_col_name;
+        rdb_parse_id(&my_charset_bin, str, &cur_ref_col_name);
+        str = rdb_check_next_token(&my_charset_bin, str, cur_ref_col_name.c_str(),
+                                 &success);
+        if(!success) {
+          break;
+        }
+        ref_col_name = ref_col_name + ", " + cur_ref_col_name;
+      }*/
+
+      found = referenced_tdef->find_key_gl_index_by_name(
+          ref_col_name, fk_def.m_referenced_gl_index_id);
+      if (!found) {
+        err = HA_ERR_CANNOT_ADD_FOREIGN;
+        dict_manager.unlock();
+        goto error;
+      }
+
+      str = rdb_check_next_token(&my_charset_bin, str, ")", &success);
+      if (!success) {
+        continue;
+      }
+
+      uint32_t type = DICT_FOREIGN_ON_DELETE_NO_ACTION | DICT_FOREIGN_ON_UPDATE_NO_ACTION;
+      bool is_on_delete = false;
+
+      std::string fk_id = "fk_" + constraint_name_by_default;
+      while (true) {
+        str = rdb_check_next_token(&my_charset_bin, str, "ON", &success);
+        if (success) {
+          str = rdb_check_next_token(&my_charset_bin, str, "DELETE", &success);
+          if (!success) {
+            str = rdb_check_next_token(&my_charset_bin, str, "UPDATE", &success);
+            if (!success) {
+              ddl_manager.remove(m_tbl_def,batch,true);
+              err = HA_ERR_CANNOT_ADD_FOREIGN;
+              dict_manager.unlock();
+              goto error;
+            }
+            is_on_delete = false;
+          } else {
+            is_on_delete = true;
+          }
+        } else {
+          break;
+        }
+
+        str = rdb_check_next_token(&my_charset_bin, str, "RESTRICT", &success);
+        if (success) {
+          if (is_on_delete) {
+            type |= DICT_FOREIGN_ON_DELETE_NO_ACTION;
+          } else {
+            type |= DICT_FOREIGN_ON_UPDATE_NO_ACTION;
+          }
+        }
+
+        str = rdb_check_next_token(&my_charset_bin, str, "CASCADE", &success);
+        if (success) {
+          if (is_on_delete) {
+            type |= DICT_FOREIGN_ON_DELETE_CASCADE;
+          } else {
+            type |= DICT_FOREIGN_ON_UPDATE_CASCADE;
+          }
+        }
+
+        str = rdb_check_next_token(&my_charset_bin, str, "SET", &success);
+        if (success) {
+          str = rdb_check_next_token(&my_charset_bin, str, "NULL", &success);
+          if (success) {
+            if (is_on_delete) {
+              type |= DICT_FOREIGN_ON_DELETE_SET_NULL;
+            } else {
+              type |= DICT_FOREIGN_ON_UPDATE_SET_NULL;
+            }
+          }
+        }
+
+        str = rdb_check_next_token(&my_charset_bin, str, "NO", &success);
+        if (success) {
+          str = rdb_check_next_token(&my_charset_bin, str, "ACTION", &success);
+          if (success) {
+            if (is_on_delete) {
+              type |= DICT_FOREIGN_ON_DELETE_NO_ACTION;
+            } else {
+              type |= DICT_FOREIGN_ON_UPDATE_NO_ACTION;
+            }
+          }
+        }
+      }
+
+      if (!has_constraint) {
+        fk_def.id = fk_id;
+      } 
+      
+      dict_manager.put_fk_def(batch, fk_def.m_foreign_gl_index_id,
+                              fk_def.m_referenced_gl_index_id, type, fk_def.id);
+      fk_def.m_type = type;
+      m_tbl_def->m_foreign_descr_set.insert(fk_def);
+      referenced_tdef->m_referenced_descr_set.insert(fk_def);
+      dict_manager.put_fk_set(batch, fk_def);
+    }
+
+    str = rdb_skip_spaces(&my_charset_bin, str);
+    if (*str != '\0') {
+      err = HA_ERR_CANNOT_ADD_FOREIGN;
+      dict_manager.unlock();
+      goto error;
+    }
+  }
+
   err = ddl_manager.put_and_write(m_tbl_def, batch);
   if (err != HA_EXIT_SUCCESS) {
     dict_manager.unlock();
     goto error;
-  }
-
+  }  
+  
   err = dict_manager.commit(batch);
   if (err != HA_EXIT_SUCCESS) {
+    ddl_manager.remove(m_tbl_def,batch,true);
     dict_manager.unlock();
     goto error;
   }
@@ -8409,6 +8805,59 @@ int ha_rocksdb::index_next(uchar *const buf) {
   DBUG_RETURN(rc);
 }
 
+int ha_rocksdb::index_next_same_intern(uchar * buf, const uchar *key, uint keylen) {
+  DBUG_ENTER_FUNC();
+
+  bool move_forward = true;
+  ha_statistic_increment(&SSV::ha_read_next_count);
+  if (m_key_descr_arr[active_index]->m_is_reverse_cf) {
+    move_forward = false;
+  }
+
+  int rc;
+
+  if (active_index == pk_index(table, m_tbl_def)) {
+    rc = rnd_next_with_direction(buf, move_forward);
+  } else {
+    if (m_skip_scan_it_next_call) {
+      m_skip_scan_it_next_call = false;
+    } else {
+      if (move_forward)
+        m_scan_it->Next(); /* this call cannot fail */
+      else
+        m_scan_it->Prev();
+    }
+    rocksdb_skip_expired_records(*m_key_descr_arr[active_index], m_scan_it,
+                                 !move_forward);
+    const Rdb_key_def &kd = *m_key_descr_arr[active_index];
+
+    if (!is_valid(m_scan_it)) {
+      table->status = STATUS_NOT_FOUND;
+      return HA_ERR_END_OF_FILE;
+    }
+    const rocksdb::Slice rkey = m_scan_it->key();
+
+    if (!kd.covers_key(rkey)) {
+      table->status = STATUS_NOT_FOUND;
+      return HA_ERR_END_OF_FILE;
+    }
+
+    const rocksdb::Slice prefix((const char *)key,
+                                keylen);
+    if (!kd.value_matches_prefix(rkey, prefix)) {
+      table->status = STATUS_NOT_FOUND;
+      return HA_ERR_END_OF_FILE;
+    }
+
+    rc = secondary_index_read(active_index, buf);
+  }
+
+  if (rc == HA_ERR_KEY_NOT_FOUND)
+    rc = HA_ERR_END_OF_FILE;
+
+  DBUG_RETURN(rc);
+}
+
 /**
   @return
     HA_EXIT_SUCCESS  OK
@@ -8553,6 +9002,49 @@ int ha_rocksdb::index_first_intern(uchar *const buf) {
   // snapshot here (i.e. it did not exist prior to this)
   for (;;) {
     setup_scan_iterator(kd, &index_key, false, key_start_matching_bytes);
+    m_scan_it->Seek(index_key);
+    m_skip_scan_it_next_call = true;
+
+    rc = index_next_with_direction(buf, true);
+    if (rc != HA_ERR_LOCK_DEADLOCK || !is_new_snapshot)
+      break; // exit the loop
+
+    // release the snapshot and iterator so they will be regenerated
+    tx->release_snapshot();
+    release_scan_iterator();
+  }
+
+  if (!rc) {
+    /*
+      index_next is always incremented on success, so decrement if it is
+      index_first instead
+     */
+    stats.rows_index_first++;
+    stats.rows_index_next--;
+  }
+
+  DBUG_RETURN(rc);
+}
+
+int ha_rocksdb::index_first_same_intern(uchar *const buf, const uchar *key, uint keylen) {
+  DBUG_ENTER_FUNC();
+
+  int rc;
+
+  DBUG_ASSERT(key != nullptr);
+
+  const Rdb_key_def &kd = *m_key_descr_arr[active_index];
+
+  rocksdb::Slice index_key((const char *)key, keylen);
+
+  Rdb_transaction *const tx = get_or_create_tx(table->in_use);
+  DBUG_ASSERT(tx != nullptr);
+
+  const bool is_new_snapshot = !tx->has_snapshot();
+  // Loop as long as we get a deadlock error AND we end up creating the
+  // snapshot here (i.e. it did not exist prior to this)
+  for (;;) {
+    setup_scan_iterator(kd, &index_key, false, keylen);
     m_scan_it->Seek(index_key);
     m_skip_scan_it_next_call = true;
 
@@ -8914,6 +9406,11 @@ void ha_rocksdb::set_last_rowkey(const uchar *const old_data) {
   }
 }
 
+void ha_rocksdb::set_last_rowkey(const char *const rowid, const uint rowid_size) {
+  m_last_rowkey.copy((const char *)rowid, rowid_size,
+                    &my_charset_bin);
+}
+
 int ha_rocksdb::get_pk_for_update(struct update_row_info *const row_info) {
   int size;
 
@@ -8950,6 +9447,290 @@ int ha_rocksdb::get_pk_for_update(struct update_row_info *const row_info) {
   row_info->new_pk_slice =
       rocksdb::Slice((const char *)m_pk_packed_tuple, size);
 
+  return HA_EXIT_SUCCESS;
+}
+
+// check if other table has the same key in the given index
+int ha_rocksdb::check_key_in_other_table(const Rdb_key_def &my_key_def,
+                                         const GL_INDEX_ID &my_gl_index_id,
+                                         const GL_INDEX_ID &other_gl_index_id,
+                                         const uchar *const buf,
+                                         Rdb_transaction *tx,
+                                         bool *const found,
+                                         Rdb_table_handler **const other_tbl_handler, /* = nullptr */
+                                         std::string *const other_tbl_full_name, /* = nullptr */
+                                         Rdb_tbl_def **const other_tbl_def, /* = nullptr */
+                                         rocksdb::Slice *const other_tbl_part_key, /*  = nullptr */
+                                         std::unique_ptr<rocksdb::Iterator> *const other_tbl_iter, /* = nullptr */
+                                         uint *const other_tbl_index_key_id /* = nullptr */) {
+  DBUG_ASSERT(found != nullptr);
+  std::shared_ptr<const Rdb_key_def> other_tbl_key_def = ddl_manager.safe_find(other_gl_index_id);
+  std::string other_dbname_tablename = ddl_manager.safe_get_table_name(other_gl_index_id);
+  if (other_tbl_def) {
+    *other_tbl_def = ddl_manager.find(other_dbname_tablename);
+  }
+  std::string other_dbname;
+  std::string other_tablename;
+  int rc = rdb_split_normalized_tablename(other_dbname_tablename, &other_dbname, &other_tablename);
+  if (rc != HA_EXIT_SUCCESS) {
+    DBUG_RETURN(rc);
+  }
+  std::string other_full_table_name = "./" + other_dbname + "/" + other_tablename;
+  if (other_tbl_full_name) {
+    *other_tbl_full_name = other_full_table_name;
+  }
+  Rdb_table_handler *other_table_handler = rdb_open_tables.get_table_handler(other_full_table_name.c_str());
+  if (other_tbl_handler) {
+    *other_tbl_handler = other_table_handler;
+  }
+  TABLE* other_table = other_table_handler->m_table;
+  if (other_tbl_index_key_id) {
+    *other_tbl_index_key_id = other_tbl_key_def->get_keyno();
+  }
+  uchar *other_tbl_key_buf =
+    reinterpret_cast<uchar *>(my_malloc(other_tbl_key_def->max_storage_fmt_length(), MYF(0)));
+  uchar *other_tbl_key_packed_tuple =
+    reinterpret_cast<uchar *>(my_malloc(other_tbl_key_def->max_storage_fmt_length(), MYF(0)));
+  int size = other_tbl_key_def->pack_key_from_other_table(table, other_table, my_key_def, other_tbl_key_buf, buf,
+                      other_tbl_key_packed_tuple);
+  rocksdb::Slice other_tbl_key =
+    rocksdb::Slice((const char *)other_tbl_key_packed_tuple, size);
+
+  if (other_tbl_part_key) {
+    *other_tbl_part_key = other_tbl_key;
+  }
+
+  uchar lower_bound_buf[Rdb_key_def::INDEX_NUMBER_SIZE];
+  uchar upper_bound_buf[Rdb_key_def::INDEX_NUMBER_SIZE];
+  rocksdb::Slice lower_bound_slice;
+  rocksdb::Slice upper_bound_slice;
+
+  const bool total_order_seek = !check_bloom_and_set_bounds(
+    ha_thd(), *other_tbl_key_def, other_tbl_key, false, Rdb_key_def::INDEX_NUMBER_SIZE,
+    lower_bound_buf, upper_bound_buf, &lower_bound_slice, &upper_bound_slice);
+  const bool fill_cache = !THDVAR(ha_thd(), skip_fill_cache);
+
+  rocksdb::Iterator *const iter = tx->get_iterator(
+    other_tbl_key_def->get_cf(), total_order_seek, fill_cache, lower_bound_slice,
+    upper_bound_slice, true /* read current data */,
+    false /* acquire snapshot */);
+
+  iter->Seek(other_tbl_key);
+  *found = !read_key_exact(*other_tbl_key_def, iter, false, other_tbl_key,
+                      tx->m_snapshot_timestamp);
+  if (other_tbl_iter) {
+    *other_tbl_iter = std::unique_ptr<rocksdb::Iterator>(iter);
+  }
+  return HA_EXIT_SUCCESS;
+}
+
+int ha_rocksdb::check_fk_constraint_on_referenced_table(const uint &key_id,
+                                                        const Rdb_key_def &kd,
+                                                        const struct update_row_info &row_info) {
+  // 2018/06/27 Quan Zhang check foreign key constraints
+  if (skip_check_fk_constraint_on_referenced_table) {
+    return HA_EXIT_SUCCESS;
+  }
+  for (auto& fk_def : m_tbl_def->m_foreign_descr_set) {
+    if (m_key_descr_arr[key_id]->get_gl_index_id() == fk_def.m_foreign_gl_index_id) {
+      // check if referenced table has the same key
+      bool found;
+      int rc = check_key_in_other_table(kd, fk_def.m_foreign_gl_index_id,
+                                        fk_def.m_referenced_gl_index_id,
+                                        row_info.new_data,
+                                        row_info.tx,
+                                        &found);
+      if (rc != HA_EXIT_SUCCESS) {
+        DBUG_RETURN(rc);
+      }
+      if (!found) {
+        return HA_ERR_NO_REFERENCED_ROW;
+      }
+    }
+  }
+  return HA_EXIT_SUCCESS;
+}
+
+static inline void update_row_in_foreign_table(const std::shared_ptr<const Rdb_key_def> &key_def,
+                                 std::shared_ptr<const Rdb_key_def> &foreign_key_def,
+                                 TABLE *foreign_table,
+                                 const uchar *const foreign_table_old_data,
+                                 uchar *const foreign_table_new_data,
+                                 TABLE *table,
+                                 const uchar *const buf) {
+  uint32 foreign_table_buf_size = 0;
+  for (uint i = 0; i < foreign_table->s->fields; i++) {
+    Field *const foreign_table_field = foreign_table->field[i];
+    foreign_table_buf_size += foreign_table_field->pack_length();
+  }
+  memcpy(foreign_table_new_data, foreign_table_old_data, foreign_table_buf_size);
+  for (uint i = 0; i < foreign_table->s->fields; i++) {
+    Field *const foreign_table_field = foreign_table->field[i];
+    if (std::string(foreign_table_field->field_name) == foreign_key_def->get_name()) {
+
+      uint foreign_table_field_offset = foreign_table_field->ptr - foreign_table_new_data;
+      uint foreign_table_null_offset = foreign_table_field->null_offset();
+      bool foreign_table_maybe_null = foreign_table_field->real_maybe_null();
+      foreign_table_field->move_field(foreign_table_new_data + foreign_table_field_offset,
+                        foreign_table_maybe_null ?
+                          foreign_table_new_data + foreign_table_null_offset : nullptr,
+                        foreign_table_field->null_bit);
+
+      for (uint j = 0; j < table->s->fields; j++) {
+        Field *const field = table->field[j];
+        if (std::string(field->field_name) == key_def->get_name()) {
+          uint field_offset = field->ptr - buf;
+          uint null_offset = field->null_offset();
+          bool maybe_null = field->real_maybe_null();
+          field->move_field(const_cast<uchar*>(buf) + field_offset,
+                            maybe_null ? const_cast<uchar*>(buf) + null_offset : nullptr,
+                            field->null_bit);
+          memcpy(foreign_table_field->ptr, field->ptr,
+                 field->pack_length());
+          break;
+        }
+      }
+      break;
+    }
+  }
+}
+
+static inline void set_null_in_foreign_table(std::shared_ptr<const Rdb_key_def> &foreign_key_def,
+                                 TABLE *foreign_table,
+                                 const uchar *const foreign_table_old_data,
+                                 uchar *const foreign_table_new_data,
+                                 TABLE *table) {
+  for (uint i = 0; i < foreign_table->s->fields; i++) {
+    Field *const foreign_table_field = foreign_table->field[i];
+      uint foreign_table_field_offset = foreign_table_field->ptr - foreign_table_new_data;
+      uint foreign_table_null_offset = foreign_table_field->null_offset();
+      bool foreign_table_maybe_null = foreign_table_field->real_maybe_null();
+      foreign_table_field->move_field(foreign_table_new_data + foreign_table_field_offset,
+                        foreign_table_maybe_null ?
+                          foreign_table_new_data + foreign_table_null_offset : nullptr,
+                        foreign_table_field->null_bit);
+    if (std::string(foreign_table_field->field_name) == foreign_key_def->get_name()) {
+      foreign_table_field->set_null();
+      memcpy(foreign_table_field->ptr, foreign_table->s->default_values + foreign_table_field_offset, foreign_table_field->pack_length());
+    } else {
+      memcpy(foreign_table_field->ptr, foreign_table_old_data + foreign_table_field_offset, foreign_table_field->pack_length());
+    }
+  }
+}
+
+int ha_rocksdb::check_fk_constraint_on_foreign_table(const uint &key_id,
+                                                     const Rdb_key_def &kd,
+                                                     const uchar *const old_data,
+                                                     const uchar *const new_data,
+                                                     Rdb_transaction *tx,
+                                                     const bool is_update) {
+  // 2018/07/09 Quan Zhang check foreign key constraints on foreign table
+  for (auto& fk_def : m_tbl_def->m_referenced_descr_set) {
+    if (m_key_descr_arr[key_id]->get_gl_index_id() == fk_def.m_referenced_gl_index_id) {
+      // check if foreign table has the same key
+      bool found;
+      Rdb_table_handler *foreign_tbl_handler;
+      std::string foreign_tbl_full_name;
+      Rdb_tbl_def *foreign_tbl_def;
+      std::unique_ptr<rocksdb::Iterator> foreign_tbl_it;
+      uint foreign_tbl_index_key_id;
+      rocksdb::Slice foreign_tbl_part_key;
+      int rc = check_key_in_other_table(kd, fk_def.m_referenced_gl_index_id,
+                                        fk_def.m_foreign_gl_index_id,
+                                        old_data,
+                                        tx,
+                                        &found,
+                                        &foreign_tbl_handler,
+                                        &foreign_tbl_full_name,
+                                        &foreign_tbl_def,
+                                        &foreign_tbl_part_key,
+                                        &foreign_tbl_it,
+                                        &foreign_tbl_index_key_id
+                                        );
+      if (rc != HA_EXIT_SUCCESS) {
+        DBUG_RETURN(rc);
+      }
+      if (found) {
+        if ((is_update && (fk_def.m_type & DICT_FOREIGN_ON_UPDATE_CASCADE || fk_def.m_type & DICT_FOREIGN_ON_UPDATE_SET_NULL)) ||
+            (!is_update && (fk_def.m_type & DICT_FOREIGN_ON_DELETE_CASCADE || fk_def.m_type & DICT_FOREIGN_ON_DELETE_SET_NULL))) {
+          // update or delete the foreign key in the foreign table
+          bool is_delete_cascade = !is_update && (fk_def.m_type & DICT_FOREIGN_ON_DELETE_CASCADE);
+          std::unique_ptr<ha_rocksdb> foreign_table_handler(new ha_rocksdb(*this));
+          foreign_tbl_handler->m_table->in_use = ha_thd();
+          my_bitmap_map *const old_map = dbug_tmp_use_all_columns(foreign_tbl_handler->m_table, foreign_tbl_handler->m_table->write_set);
+          foreign_table_handler->change_table_ptr(foreign_tbl_handler->m_table, foreign_tbl_handler->m_table->s);
+          rc = foreign_table_handler->open(foreign_tbl_full_name.c_str(), O_WRONLY, false);
+          if (rc != HA_EXIT_SUCCESS) {
+            DBUG_RETURN(rc);
+          }
+          if (!is_delete_cascade) {
+            foreign_table_handler->set_skip_check_fk_constraint_on_referenced_table();
+          }
+          bool is_fk_pk = (foreign_tbl_index_key_id == foreign_tbl_handler->m_table->s->primary_key);
+          if (is_fk_pk) {
+            foreign_table_handler->set_pk_packed_tuple(foreign_tbl_part_key.data(), foreign_tbl_part_key.size());
+          } else {
+            foreign_table_handler->set_sk_packed_tuple(foreign_tbl_part_key.data(), foreign_tbl_part_key.size());
+          }
+
+          foreign_table_handler->external_lock(ha_thd(), F_WRLCK);
+
+          rc = foreign_table_handler->ha_index_init(foreign_tbl_index_key_id, true);
+          if (rc != HA_EXIT_SUCCESS) {
+            DBUG_RETURN(rc);
+          }
+
+          if (is_delete_cascade) {
+            rc = foreign_table_handler->index_first_same_intern(foreign_tbl_handler->m_table->record[0], (const uchar *)foreign_tbl_part_key.data(),
+                                                          foreign_tbl_part_key.size());
+            while (rc == 0) {
+              rc = foreign_table_handler->delete_row(foreign_tbl_handler->m_table->record[0]);
+              if (rc != HA_EXIT_SUCCESS) {
+                DBUG_RETURN(rc);
+              }
+
+              rc = foreign_table_handler->index_next_same_intern(foreign_tbl_handler->m_table->record[0], (const uchar *)foreign_tbl_part_key.data(), foreign_tbl_part_key.size());
+            }
+          } else {
+            rc = foreign_table_handler->index_first_same_intern(foreign_tbl_handler->m_table->record[1], (const uchar *)foreign_tbl_part_key.data(),
+                                                          foreign_tbl_part_key.size());
+            std::shared_ptr<const Rdb_key_def> foreign_key_def = ddl_manager.safe_find(fk_def.m_foreign_gl_index_id);
+            while (rc == 0) {
+              // pack new key in foreign table
+              if (is_update && fk_def.m_type & DICT_FOREIGN_ON_UPDATE_CASCADE) {
+                update_row_in_foreign_table(m_key_descr_arr[key_id], foreign_key_def, foreign_tbl_handler->m_table, foreign_tbl_handler->m_table->record[1],
+                                            foreign_tbl_handler->m_table->record[0], table, new_data);
+              } else {
+                set_null_in_foreign_table(foreign_key_def, foreign_tbl_handler->m_table, foreign_tbl_handler->m_table->record[1],
+                                          foreign_tbl_handler->m_table->record[0], table);
+              }
+              rc = foreign_table_handler->update_row(foreign_tbl_handler->m_table->record[1], foreign_tbl_handler->m_table->record[0]);
+              if (rc != HA_EXIT_SUCCESS) {
+                DBUG_RETURN(rc);
+              }
+
+              rc = foreign_table_handler->index_next_same_intern(foreign_tbl_handler->m_table->record[1], (const uchar *)foreign_tbl_part_key.data(), 
+                                                          foreign_tbl_part_key.size());
+            }
+          }
+
+          rc = foreign_table_handler->ha_index_end();
+          if (rc != HA_EXIT_SUCCESS) {
+            DBUG_RETURN(rc);
+          }
+
+          foreign_table_handler->external_lock(ha_thd(), F_UNLCK);
+          rc = foreign_table_handler->close();
+          if (rc != HA_EXIT_SUCCESS) {
+            DBUG_RETURN(rc);
+          }
+          dbug_tmp_restore_column_map(foreign_tbl_handler->m_table->write_set, old_map);
+        } else {
+          return HA_ERR_ROW_IS_REFERENCED;
+        }
+      }
+    }
+  }
   return HA_EXIT_SUCCESS;
 }
 
@@ -9022,12 +9803,15 @@ int ha_rocksdb::check_and_lock_sk(const uint &key_id,
     return HA_EXIT_SUCCESS;
   }
 
-  KEY *key_info = nullptr;
+  const Rdb_key_def &kd = *m_key_descr_arr[key_id];
+
   uint n_null_fields = 0;
+  KEY *key_info = nullptr;
   uint user_defined_key_parts = 1;
 
   key_info = &table->key_info[key_id];
   user_defined_key_parts = key_info->user_defined_key_parts;
+
   /*
     If there are no uniqueness requirements, there's no need to obtain a
     lock for this key.
@@ -9035,8 +9819,6 @@ int ha_rocksdb::check_and_lock_sk(const uint &key_id,
   if (!(key_info->flags & HA_NOSAME)) {
     return HA_EXIT_SUCCESS;
   }
-
-  const Rdb_key_def &kd = *m_key_descr_arr[key_id];
 
   /*
     Calculate the new key for obtaining the lock
@@ -9093,6 +9875,10 @@ int ha_rocksdb::check_and_lock_sk(const uint &key_id,
   */
 
   const bool all_parts_used = (user_defined_key_parts == kd.get_key_parts());
+  uchar lower_bound_buf[Rdb_key_def::INDEX_NUMBER_SIZE];
+  uchar upper_bound_buf[Rdb_key_def::INDEX_NUMBER_SIZE];
+  rocksdb::Slice lower_bound_slice;
+  rocksdb::Slice upper_bound_slice;
 
   /*
     This iterator seems expensive since we need to allocate and free
@@ -9105,10 +9891,6 @@ int ha_rocksdb::check_and_lock_sk(const uint &key_id,
 
     The bloom filter may need to be disabled for this lookup.
   */
-  uchar lower_bound_buf[Rdb_key_def::INDEX_NUMBER_SIZE];
-  uchar upper_bound_buf[Rdb_key_def::INDEX_NUMBER_SIZE];
-  rocksdb::Slice lower_bound_slice;
-  rocksdb::Slice upper_bound_slice;
 
   const bool total_order_seek = !check_bloom_and_set_bounds(
       ha_thd(), kd, new_slice, all_parts_used, Rdb_key_def::INDEX_NUMBER_SIZE,
@@ -9150,6 +9932,24 @@ int ha_rocksdb::check_uniqueness_and_lock(
   for (uint key_id = 0; key_id < m_tbl_def->m_key_count; key_id++) {
     bool found;
     int rc;
+
+    rc = check_fk_constraint_on_referenced_table(key_id,
+                                                 *m_key_descr_arr[key_id],
+                                                 row_info);
+    if (rc) {
+      return rc;
+    }
+
+    if (row_info.old_data != nullptr) {
+      rc = check_fk_constraint_on_foreign_table(key_id,
+                                                *m_key_descr_arr[key_id],
+                                                row_info.old_data,
+                                                row_info.new_data,
+                                                row_info.tx, true);
+      if (rc) {
+        DBUG_RETURN(rc);
+      }
+    }
 
     if (is_pk(key_id, table, m_tbl_def)) {
       rc = check_and_lock_unique_pk(key_id, row_info, &found, pk_changed);
@@ -9908,6 +10708,13 @@ int ha_rocksdb::delete_row(const uchar *const buf) {
   rocksdb::Slice key_slice(m_last_rowkey.ptr(), m_last_rowkey.length());
   Rdb_transaction *const tx = get_or_create_tx(table->in_use);
   ulonglong bytes_written = 0;
+
+  for (uint i = 0; i < m_tbl_def->m_key_count; i++) {
+    int rc = check_fk_constraint_on_foreign_table(i, *m_key_descr_arr[i], buf, nullptr, tx, false);
+    if (rc) {
+      DBUG_RETURN(rc);
+    }
+  }
 
   const uint index = pk_index(table, m_tbl_def);
   rocksdb::Status s =
@@ -10669,6 +11476,30 @@ int ha_rocksdb::delete_table(const char *const tablename) {
   Rdb_tbl_def *const tbl = get_table_if_exists(tablename);
   if (!tbl)
     DBUG_RETURN(HA_ERR_NO_SUCH_TABLE);
+  
+  // if the deleted table is being referenced, and it is not referenced by the table itself,
+  // we will need to return failure
+  if (!tbl->m_referenced_descr_set.empty()) {
+    for (auto it = tbl->m_referenced_descr_set.begin();
+      it != tbl->m_referenced_descr_set.end(); ++it) {
+      std::string foreign_table_name = ddl_manager.safe_get_table_name(it->m_foreign_gl_index_id);
+      if (foreign_table_name != tablename) {
+        DBUG_RETURN(HA_ERR_ROW_IS_REFERENCED);
+      }
+    }
+  }
+  // remove the fk definition in ddl and in memory
+  for (auto it = tbl->m_foreign_descr_set.begin();
+    it != tbl->m_foreign_descr_set.end(); ++it) {
+    dict_manager.delete_fk_def(batch, it->m_foreign_gl_index_id);
+    dict_manager.delete_fk_in_set(batch,it->id);
+    std::string referenced_table_name =
+        ddl_manager.safe_get_table_name(it->m_referenced_gl_index_id);
+    auto referenced_tdef = ddl_manager.find(referenced_table_name);
+    DBUG_ASSERT(referenced_tdef != nullptr);
+    referenced_tdef->m_referenced_descr_set.erase(*it);
+  }
+
   dict_manager.add_drop_table(tbl->m_key_descr_arr, tbl->m_key_count, batch);
 
   /*
@@ -11459,7 +12290,7 @@ bool ha_rocksdb::prepare_inplace_alter_table(
       (my_core::Alter_inplace_info::DROP_INDEX |
        my_core::Alter_inplace_info::DROP_UNIQUE_INDEX |
        my_core::Alter_inplace_info::ADD_INDEX |
-       my_core::Alter_inplace_info::ADD_UNIQUE_INDEX)) {
+       my_core::Alter_inplace_info::ADD_UNIQUE_INDEX )) {
 
     if (has_hidden_pk(altered_table)) {
       new_n_keys += 1;
@@ -11476,6 +12307,8 @@ bool ha_rocksdb::prepare_inplace_alter_table(
         m_tbl_def->m_auto_incr_val.load(std::memory_order_relaxed);
     new_tdef->m_hidden_pk_val =
         m_tbl_def->m_hidden_pk_val.load(std::memory_order_relaxed);
+    new_tdef->m_foreign_descr_set = m_tbl_def->m_foreign_descr_set;
+    new_tdef->m_referenced_descr_set = m_tbl_def->m_referenced_descr_set;
 
     if (create_key_defs(altered_table, new_tdef, table, m_tbl_def)) {
       /* Delete the new key descriptors */
@@ -12033,6 +12866,187 @@ bool ha_rocksdb::commit_inplace_alter_table(
   }
 
   DBUG_RETURN(HA_EXIT_SUCCESS);
+}
+
+static FOREIGN_KEY_INFO *get_foreign_key_info(
+  THD *thd,
+  const Rdb_fk_def &foreign
+)
+{
+  FOREIGN_KEY_INFO	f_key_info;
+	FOREIGN_KEY_INFO *pf_key_info;
+
+  std::string foreign_table_name = ddl_manager.safe_get_table_name(foreign.m_foreign_gl_index_id);
+  std::string referenced_table_name = ddl_manager.safe_get_table_name(foreign.m_referenced_gl_index_id);
+
+  std::string str;
+  std::string foreign_db;
+  std::string foreign_table;
+  std::string referenced_db;
+  std::string referenced_table;
+
+  if (rdb_split_normalized_tablename(foreign_table_name, &foreign_db, &foreign_table) != HA_EXIT_SUCCESS) {
+    SHIP_ASSERT(false);
+    return nullptr;
+  }
+
+  if (rdb_split_normalized_tablename(referenced_table_name, &referenced_db, &referenced_table) != HA_EXIT_SUCCESS) {
+    SHIP_ASSERT(false);
+    return nullptr;
+  }
+
+  std::stringstream id;
+  id << foreign.m_foreign_gl_index_id.cf_id << "," << foreign.m_foreign_gl_index_id.index_id << ","
+    << foreign.m_referenced_gl_index_id.cf_id << "," << foreign.m_referenced_gl_index_id.index_id;
+
+  f_key_info.foreign_id = thd_make_lex_string(thd, 0, id.str().c_str(),
+		(uint) id.str().length(), 1);
+
+  f_key_info.referenced_db = thd_make_lex_string(
+		thd, 0, referenced_db.c_str(), referenced_db.length(), 1);
+
+  f_key_info.referenced_table = thd_make_lex_string(
+		thd, 0, referenced_table.c_str(), referenced_table.length(), 1);
+
+  f_key_info.foreign_db = thd_make_lex_string(
+		thd, 0, foreign_db.c_str(), foreign_db.length(), 1);
+
+  f_key_info.foreign_table = thd_make_lex_string(
+		thd, 0, foreign_table.c_str(), foreign_table.length(), 1);
+
+  LEX_STRING *name = NULL;
+
+  std::string foreign_column_name;
+  std::string referenced_column_name;
+
+  std::shared_ptr<const Rdb_key_def> foreign_key_def = ddl_manager.safe_find(foreign.m_foreign_gl_index_id);
+  foreign_column_name = foreign_key_def->m_name;
+
+  name = thd_make_lex_string(thd, name, foreign_column_name.c_str(),
+					   (uint) foreign_column_name.length(), 1);
+
+  f_key_info.foreign_fields.push_back(name);
+
+  std::shared_ptr<const Rdb_key_def> referenced_key_def = ddl_manager.safe_find(foreign.m_referenced_gl_index_id);
+  referenced_column_name = referenced_key_def->m_name;
+
+  name = thd_make_lex_string(thd, name, referenced_column_name.c_str(),
+					   (uint) referenced_column_name.length(), 1);
+
+  f_key_info.referenced_fields.push_back(name);
+
+  LEX_STRING *referenced_key_name = NULL;
+  referenced_key_name = thd_make_lex_string(thd, referenced_key_name, referenced_column_name.c_str(),
+					   (uint) referenced_column_name.length(), 1);
+  f_key_info.referenced_key_name = referenced_key_name;
+
+  uint len;
+  const char *ptr;
+
+  if (foreign.m_type & DICT_FOREIGN_ON_DELETE_CASCADE) {
+		len = 7;
+		ptr = "CASCADE";
+	} else if (foreign.m_type & DICT_FOREIGN_ON_DELETE_SET_NULL) {
+		len = 8;
+		ptr = "SET NULL";
+	} else if (foreign.m_type & DICT_FOREIGN_ON_DELETE_NO_ACTION) {
+		len = 9;
+		ptr = "NO ACTION";
+	} else {
+		len = 8;
+		ptr = "RESTRICT";
+	}
+
+	f_key_info.delete_method = thd_make_lex_string(
+		thd, f_key_info.delete_method, ptr,
+		static_cast<unsigned int>(len), 1);
+
+	if (foreign.m_type & DICT_FOREIGN_ON_UPDATE_CASCADE) {
+		len = 7;
+		ptr = "CASCADE";
+	} else if (foreign.m_type & DICT_FOREIGN_ON_UPDATE_SET_NULL) {
+		len = 8;
+		ptr = "SET NULL";
+	} else if (foreign.m_type & DICT_FOREIGN_ON_UPDATE_NO_ACTION) {
+		len = 9;
+		ptr = "NO ACTION";
+	} else {
+		len = 8;
+		ptr = "RESTRICT";
+	}
+
+	f_key_info.update_method = thd_make_lex_string(
+		thd, f_key_info.update_method, ptr,
+		static_cast<unsigned int>(len), 1);
+
+	pf_key_info = (FOREIGN_KEY_INFO*) thd_memdup(thd, &f_key_info,
+						      sizeof(FOREIGN_KEY_INFO));
+
+	return(pf_key_info);
+}
+
+/** Gets the foreign key create info for a table stored in Rocksdb.
+ @return own: character string in the form which can be inserted to the
+ CREATE TABLE statement, MUST be freed with
+ ha_innobase::free_foreign_key_create_info */
+
+char *ha_rocksdb::get_foreign_key_create_info(void) { return (NULL); }
+
+/** Gets the list of foreign keys in this table.
+ @return always 0, that is, always succeeds */
+
+int ha_rocksdb::get_foreign_key_list(
+    THD *thd,                           /*!< in: user thread handle */
+    List<FOREIGN_KEY_INFO> *f_key_list) /*!< out: foreign key list */
+{
+  for (auto it = m_tbl_def->m_foreign_descr_set.begin();
+      it != m_tbl_def->m_foreign_descr_set.end(); ++it) {
+    FOREIGN_KEY_INFO*	pf_key_info = get_foreign_key_info(thd, *it);
+    if (pf_key_info) {
+      f_key_list->push_back(pf_key_info);
+    }
+  }
+  return (0);
+}
+
+/** Gets the set of foreign keys where this table is the referenced table.
+ @return always 0, that is, always succeeds */
+
+int ha_rocksdb::get_parent_foreign_key_list(
+    THD *thd,                           /*!< in: user thread handle */
+    List<FOREIGN_KEY_INFO> *f_key_list) /*!< out: foreign key list */
+{
+  for (auto it = m_tbl_def->m_referenced_descr_set.begin();
+      it != m_tbl_def->m_referenced_descr_set.end(); ++it) {
+    FOREIGN_KEY_INFO*	pf_key_info = get_foreign_key_info(thd, *it);
+    if (pf_key_info) {
+      f_key_list->push_back(pf_key_info);
+    }
+  }
+  return (0);
+}
+
+bool ha_rocksdb::can_switch_engines(void) { return false; }
+
+/** Checks if a table is referenced by a foreign key. The MySQL manual states
+ that a REPLACE is either equivalent to an INSERT, or DELETE(s) + INSERT. Only a
+ delete is then allowed internally to resolve a duplicate key conflict in
+ REPLACE, not an update.
+ @return > 0 if referenced by a FOREIGN KEY */
+
+uint ha_rocksdb::referenced_by_foreign_key(void) {
+  return (!m_tbl_def->m_referenced_descr_set.empty());
+}
+
+/** Frees the foreign key create info for a table stored in Rocksdb, if it is
+ non-NULL. */
+
+void ha_rocksdb::free_foreign_key_create_info(
+    char *str) /*!< in, own: create info string to free */
+{
+  if (str != NULL) {
+    my_free(str);
+  }
 }
 
 #define SHOW_FNAME(name) rocksdb_show_##name
@@ -13286,4 +14300,5 @@ mysql_declare_plugin(rocksdb_se){
     myrocks::rdb_i_s_cfoptions, myrocks::rdb_i_s_compact_stats,
     myrocks::rdb_i_s_global_info, myrocks::rdb_i_s_ddl,
     myrocks::rdb_i_s_index_file_map, myrocks::rdb_i_s_lock_info,
-    myrocks::rdb_i_s_trx_info, myrocks::rdb_i_s_deadlock_info mysql_declare_plugin_end;
+    myrocks::rdb_i_s_trx_info, myrocks::rdb_i_s_deadlock_info,
+    myrocks::rdb_i_s_fk mysql_declare_plugin_end;

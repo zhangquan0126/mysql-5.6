@@ -1,0 +1,29 @@
+--source include/have_rocksdb.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t1, t2, t3;
+--enable_warnings
+
+CREATE TABLE t1 (b INT PRIMARY KEY);
+
+# Try foreign key with cascade on delete and cascade on update
+CREATE TABLE t2 (a INT NOT NULL, b INT NOT NULL, c INT NOT NULL, INDEX(c), FOREIGN KEY (b) REFERENCES t1(b) ON UPDATE CASCADE ON DELETE CASCADE);
+CREATE TABLE t3 (a INT NOT NULL, c INT NOT NULL, FOREIGN KEY (c) REFERENCES t2(c) ON UPDATE CASCADE ON DELETE CASCADE);
+INSERT INTO t1 (b) VALUES (100),(200),(300);
+INSERT INTO t2 (a,b,c) VALUES (1,100,1000),(2,200,2000),(3,300,3000);
+INSERT INTO t3 (a,c) VALUES (1,1000),(2,2000),(3,3000);
+
+# Update a row in the referenced table which has child row should succeed and the row in the child table should also be updated
+UPDATE t1 SET b=400 WHERE b=300;
+# Delete a row in the referenced table which has child row should succeed and the row in the child tables in chain should also be deleted
+DELETE FROM t1 WHERE b=200;
+--sorted_result
+SELECT * from t1;
+--sorted_result
+SELECT * from t2;
+--sorted_result
+SELECT * from t3;
+DROP TABLE t3;
+DROP TABLE t2;
+DROP TABLE t1;
+

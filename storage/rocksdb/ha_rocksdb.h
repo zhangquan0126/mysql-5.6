@@ -304,6 +304,17 @@ const char *const RDB_TTL_COL_QUALIFIER = "ttl_col";
 #define HA_ERR_ROCKSDB_STATUS_TRY_AGAIN (HA_ERR_LAST + 25)
 #define HA_ERR_ROCKSDB_LAST HA_ERR_ROCKSDB_STATUS_TRY_AGAIN
 
+/** The flags for ON_UPDATE and ON_DELETE can be ORed; the default is that
+a foreign key constraint is enforced, therefore RESTRICT just means no flag */
+/* @{ */
+#define DICT_FOREIGN_ON_DELETE_CASCADE	1	/*!< ON DELETE CASCADE */
+#define DICT_FOREIGN_ON_DELETE_SET_NULL	2	/*!< ON UPDATE SET NULL */
+#define DICT_FOREIGN_ON_UPDATE_CASCADE	4	/*!< ON DELETE CASCADE */
+#define DICT_FOREIGN_ON_UPDATE_SET_NULL	8	/*!< ON UPDATE SET NULL */
+#define DICT_FOREIGN_ON_DELETE_NO_ACTION 16	/*!< ON DELETE NO ACTION */
+#define DICT_FOREIGN_ON_UPDATE_NO_ACTION 32	/*!< ON UPDATE NO ACTION */
+/* @} */
+
 /**
   @brief
   Rdb_table_handler is a reference-counted structure storing information for
@@ -330,6 +341,9 @@ struct Rdb_table_handler {
   uint64_t m_mtcache_count;
   uint64_t m_mtcache_size;
   uint64_t m_mtcache_last_update;
+
+  // 2018/07/02 Quan Zhang Have a copy of table definition here
+  TABLE* m_table;
 };
 
 class Rdb_key_def;
@@ -698,6 +712,12 @@ class ha_rocksdb : public my_core::handler {
 
   void set_last_rowkey(const uchar *const old_data);
 
+  void set_last_rowkey(const char *const rowid, const uint rowid_size);
+
+  std::shared_ptr<Rdb_key_def> get_pk_def() const { return m_pk_descr; }
+
+  bool skip_check_fk_constraint_on_referenced_table = false;
+
   /*
     Array of table->s->fields elements telling how to store fields in the
     record.
@@ -785,6 +805,7 @@ public:
 
   ha_rocksdb(my_core::handlerton *const hton,
              my_core::TABLE_SHARE *const table_arg);
+  ha_rocksdb(const ha_rocksdb& other);
   ~ha_rocksdb() {
     int err MY_ATTRIBUTE((__unused__));
     err = finalize_bulk_load(false);
@@ -820,6 +841,14 @@ public:
     Returns the name of the table's base name
   */
   const std::string &get_table_basename() const;
+
+  void set_pk_packed_tuple(const char *data, const std::size_t data_len);
+
+  void set_sk_packed_tuple(const char *data, const std::size_t data_len);
+
+  void set_skip_check_fk_constraint_on_referenced_table() {
+    skip_check_fk_constraint_on_referenced_table = true;
+  }
 
   /** @brief
     This is a list of flags that indicate what functionality the storage engine
@@ -1034,12 +1063,16 @@ public:
 
   int index_next(uchar *const buf) override
       MY_ATTRIBUTE((__warn_unused_result__));
+  int index_next_same_intern(uchar *buf, const uchar *key, uint keylen)
+      MY_ATTRIBUTE((__warn_unused_result__));
   int index_next_with_direction(uchar *const buf, bool move_forward)
       MY_ATTRIBUTE((__warn_unused_result__));
   int index_prev(uchar *const buf) override
       MY_ATTRIBUTE((__warn_unused_result__));
 
   int index_first(uchar *const buf) override
+      MY_ATTRIBUTE((__warn_unused_result__));
+  int index_first_same_intern(uchar *const buf, const uchar *key, uint keylen)
       MY_ATTRIBUTE((__warn_unused_result__));
   int index_last(uchar *const buf) override
       MY_ATTRIBUTE((__warn_unused_result__));
@@ -1048,6 +1081,20 @@ public:
   /*
     Default implementation from cancel_pushed_idx_cond() suits us
   */
+
+  // 2018/06/11 Quan Zhang foreign key API
+  char *get_foreign_key_create_info();
+
+  int get_foreign_key_list(THD *thd, List<FOREIGN_KEY_INFO> *f_key_list);
+
+  int get_parent_foreign_key_list(THD *thd, List<FOREIGN_KEY_INFO> *f_key_list);
+
+  bool can_switch_engines();
+
+  uint referenced_by_foreign_key();
+
+  void free_foreign_key_create_info(char *str);
+
 private:
   struct key_def_cf_info {
     rocksdb::ColumnFamilyHandle *cf_handle;
@@ -1179,6 +1226,30 @@ private:
                          const rocksdb::Slice *key,
                          struct unique_sk_buf_info *sk_info)
       MY_ATTRIBUTE((__nonnull__, __warn_unused_result__));
+  int check_key_in_other_table(const Rdb_key_def &my_key_def,
+                               const GL_INDEX_ID &my_gl_index_id,
+                               const GL_INDEX_ID &other_gl_index_id,
+                               const uchar *const buf,
+                               Rdb_transaction *tx,
+                               bool *const found,
+                               Rdb_table_handler **const other_tbl_handler = nullptr,
+                               std::string *const other_tbl_full_name = nullptr,
+                               Rdb_tbl_def **const other_tbl_def = nullptr,
+                               rocksdb::Slice *const other_tbl_part_key = nullptr,
+                               std::unique_ptr<rocksdb::Iterator> *const other_tbl_iter = nullptr,
+                               uint *const other_tbl_index_key_id = nullptr)
+      MY_ATTRIBUTE((__warn_unused_result__));
+  int check_fk_constraint_on_foreign_table(const uint &key_id,
+                                           const Rdb_key_def &kd,
+                                           const uchar *const old_data,
+                                           const uchar *const new_data,
+                                           Rdb_transaction *tx,
+                                           const bool is_update)
+      MY_ATTRIBUTE((__warn_unused_result__));
+  int check_fk_constraint_on_referenced_table(const uint &key_id,
+                                              const Rdb_key_def &kd,
+                                              const struct update_row_info &row_info)
+      MY_ATTRIBUTE((__nonnull__, __warn_unused_result__));
   int bulk_load_key(Rdb_transaction *const tx, const Rdb_key_def &kd,
                     const rocksdb::Slice &key, const rocksdb::Slice &value,
                     bool sort)
@@ -1229,7 +1300,8 @@ private:
   Rdb_tbl_def *get_table_if_exists(const char *const tablename)
       MY_ATTRIBUTE((__nonnull__, __warn_unused_result__));
   void read_thd_vars(THD *const thd) MY_ATTRIBUTE((__nonnull__));
-
+  bool drop_foreign_key(THD *const thd, std::set<std::string> &fk_set, std::string &table_name) 
+      MY_ATTRIBUTE((__nonnull__, __warn_unused_result__));
   bool contains_foreign_key(THD *const thd)
       MY_ATTRIBUTE((__nonnull__, __warn_unused_result__));
 

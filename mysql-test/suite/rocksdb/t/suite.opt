@@ -1,0 +1,4 @@
+--rocksdb
+--default-storage-engine=rocksdb
+--skip-innodb
+--default-tmp-storage-engine=MyISAM

@@ -130,7 +130,8 @@ const char *rdb_check_next_token(const struct charset_info_st *const cs,
   Parse id
 */
 const char *rdb_parse_id(const struct charset_info_st *const cs,
-                         const char *str, std::string *const id) {
+                         const char *str, std::string *const id,
+                         const bool &contain_comma) {
   // Move past any spaces
   str = rdb_skip_spaces(cs, str);
 
@@ -163,10 +164,18 @@ const char *rdb_parse_id(const struct charset_info_st *const cs,
       len++;
     }
   } else {
-    while (!my_isspace(cs, *str) && *str != '(' && *str != ')' && *str != '.' &&
-           *str != ',' && *str != '\0') {
-      str++;
-      len++;
+    if (contain_comma) {
+      while (!my_isspace(cs, *str) && *str != '(' && *str != ')' &&
+             *str != '.' && *str != '\0') {
+        str++;
+        len++;
+      }
+    } else {
+      while (!my_isspace(cs, *str) && *str != '(' && *str != ')' &&
+             *str != '.' && *str != ',' && *str != '\0') {
+        str++;
+        len++;
+      }
     }
   }
 

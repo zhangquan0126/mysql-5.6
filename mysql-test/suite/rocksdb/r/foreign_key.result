@@ -1,16 +1,38 @@
 DROP TABLE IF EXISTS t1, t2;
 CREATE TABLE t1 (b INT PRIMARY KEY);
 CREATE TABLE t2 (a INT NOT NULL, b INT NOT NULL, FOREIGN KEY (b) REFERENCES t1(b));
-ERROR 42000: This version of MySQL doesn't yet support 'FOREIGN KEY for the RocksDB storage engine'
+INSERT INTO t1 (b) VALUES (100),(200),(300);
+INSERT INTO t2 (a,b) VALUES (1,100),(2,200),(3,300);
+INSERT INTO t2 (a,b) VALUES (4,400);
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails ()
+UPDATE t2 SET b=100 WHERE a=2;
+UPDATE t2 SET b=500 WHERE a=2;
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails ()
+UPDATE t1 SET b=400 WHERE b=300;
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails ()
+DELETE FROM t1 WHERE b=100;
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails ()
+SELECT * from t1;
+b
+100
+200
+300
+SELECT * from t2;
+a	b
+1	100
+2	100
+3	300
+TRUNCATE TABLE t1;
+ERROR 42000: Cannot truncate a table referenced in a foreign key constraint (`test`.`t2`, CONSTRAINT `0,261,0,260` FOREIGN KEY (`b`) REFERENCES `test`.`t1` (`b`))
+DROP TABLE t1;
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails
+DROP TABLE t2;
 CREATE TABLE t2 (a INT NOT NULL, bforeign INT NOT NULL);
 DROP TABLE t2;
 CREATE TABLE t2 (a INT NOT NULL, foreignkey INT NOT NULL);
 DROP TABLE t2;
-CREATE TABLE t2 (a INT NOT NULL, bforeign INT not null, FOREIGN KEY (bforeign) REFERENCES t1(b));
-ERROR 42000: This version of MySQL doesn't yet support 'FOREIGN KEY for the RocksDB storage engine'
 CREATE TABLE t2 (a INT NOT NULL, b INT NOT NULL);
 ALTER TABLE t2 ADD FOREIGN KEY (b) REFERENCES t1(b);
-ERROR 42000: This version of MySQL doesn't yet support 'FOREIGN KEY for the RocksDB storage engine'
 DROP TABLE t2;
 CREATE TABLE t2 (a INT NOT NULL);
 ALTER TABLE t2 ADD bforeign INT NOT NULL;
@@ -18,8 +40,29 @@ DROP TABLE t2;
 CREATE TABLE t2 (a INT NOT NULL);
 ALTER TABLE t2 ADD foreignkey INT NOT NULL;
 DROP TABLE t2;
+TRUNCATE TABLE t1;
+INSERT INTO t1 (b) VALUES (100),(200),(300);
 CREATE TABLE t2 (a INT NOT NULL);
-ALTER TABLE t2 ADD bforeign INT NOT NULL, ADD FOREIGN KEY (bforeign) REFERENCES t1(b);
-ERROR 42000: This version of MySQL doesn't yet support 'FOREIGN KEY for the RocksDB storage engine'
+ALTER TABLE t2 ADD b INT NOT NULL, ADD FOREIGN KEY (b) REFERENCES t1(b);
+INSERT INTO t2 (a,b) VALUES (1,100),(2,200),(3,300);
+INSERT INTO t2 (a,b) VALUES (4,400);
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails ()
+UPDATE t2 SET b=100 WHERE a=2;
+UPDATE t2 SET b=500 WHERE a=2;
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails ()
+UPDATE t1 SET b=400 WHERE b=300;
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails ()
+DELETE FROM t1 WHERE b=100;
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails ()
+SELECT * from t1;
+b
+100
+200
+300
+SELECT * from t2;
+a	b
+1	100
+2	100
+3	300
 DROP TABLE t2;
 DROP TABLE t1;

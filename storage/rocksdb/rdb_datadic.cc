@@ -27,6 +27,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <stdio.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -158,9 +159,34 @@ void Rdb_key_def::setup(const TABLE *const tbl,
       key_info = &tbl->key_info[m_keyno];
       if (!hidden_pk_exists)
         pk_info = &tbl->key_info[tbl->s->primary_key];
-      m_name = std::string(key_info->name);
+      if (std::string(key_info->name) == "PRIMARY") {
+        m_name = std::string(key_info->name);
+      } else {
+        m_name = std::string(key_info->key_part->field->field_name);
+      }
     } else {
       m_name = HIDDEN_PK_NAME;
+    }
+
+    // this is to make foreign key reference to primary key with multiple columns possible
+    if (m_name == "PRIMARY") {
+      DBUG_ASSERT(!secondary_key);
+      KEY_PART_INFO key_part = key_info->key_part[0];
+      std::string cur_name = std::string(key_part.field->field_name);
+      for (uint i = 1; i < key_info->actual_key_parts; i++) {
+        cur_name = cur_name + "," + key_info->key_part[i].field->field_name;
+      }
+      m_name = cur_name;
+    }
+
+    // handle secondary key with multiple columns
+    if (secondary_key) {
+      KEY_PART_INFO key_part = key_info->key_part[0];
+      std::string cur_name = std::string(key_part.field->field_name);
+      for (uint i = 1; i < key_info->actual_key_parts - 1; i++) {
+        cur_name = cur_name + "," + key_info->key_part[i].field->field_name;
+      }
+      m_name = cur_name;
     }
 
     if (secondary_key)
@@ -230,7 +256,6 @@ void Rdb_key_def::setup(const TABLE *const tbl,
       /* this loop also loops over the 'extended key' tail */
       for (uint src_i = 0; src_i < m_key_parts; src_i++, keypart_to_set++) {
         Field *const field = key_part ? key_part->field : nullptr;
-
         if (simulating_extkey && !hidden_pk_exists) {
           DBUG_ASSERT(secondary_key);
           /* Check if this field is already present in the key definition */
@@ -1186,6 +1211,79 @@ uint Rdb_key_def::pack_record(
       unpack_info->write_uint32(key_crc32);
       unpack_info->write_uint32(val_crc32);
     }
+  }
+
+  DBUG_ASSERT(is_storage_available(tuple - packed_tuple, 0));
+
+  return tuple - packed_tuple;
+}
+
+uint Rdb_key_def::pack_key_from_other_table(
+    const TABLE *const other_tbl, const TABLE *const my_tbl,
+    const Rdb_key_def& other_tbl_key_def,
+    uchar *const pack_buffer, const uchar *const record,
+    uchar *const packed_tuple) const {
+  DBUG_ASSERT(other_tbl != nullptr);
+  DBUG_ASSERT(my_tbl != nullptr);
+  DBUG_ASSERT(pack_buffer != nullptr);
+  DBUG_ASSERT(record != nullptr);
+  DBUG_ASSERT(packed_tuple != nullptr);
+
+  uchar *tuple = packed_tuple;
+  rdb_netbuf_store_index(tuple, m_index_number);
+  tuple += INDEX_NUMBER_SIZE;
+
+  const bool hidden_pk_exists = table_has_hidden_pk(my_tbl);
+  const bool secondary_key = (m_index_type == INDEX_TYPE_SECONDARY);
+  uint n_key_parts = m_key_parts;
+  if (secondary_key)
+    n_key_parts -= hidden_pk_exists ? 1 : m_pk_key_parts;
+
+  for (uint i = 0; i < n_key_parts; i++) {
+    Field *const other_tbl_field = other_tbl_key_def.get_field_packing()[i].get_field_in_table(other_tbl);
+    DBUG_ASSERT(other_tbl_field != nullptr);
+
+    bool other_tbl_field_maybe_null = other_tbl_field->real_maybe_null();
+    uint other_tbl_field_offset = other_tbl_field->ptr - other_tbl->record[0];
+    uint other_tbl_field_null_offset = other_tbl_field->null_offset(other_tbl->record[0]);
+    bool other_tbl_field_is_real_null = other_tbl_field->is_null_in_record(const_cast<uchar*>(record));
+
+    Field *const field = m_pack_info[i].get_field_in_table(my_tbl);
+    DBUG_ASSERT(field != nullptr);
+    bool maybe_null = field->real_maybe_null();
+
+    other_tbl_field->move_field(const_cast<uchar*>(record) + other_tbl_field_offset);
+
+    bool pack = true;
+    if (maybe_null) {
+      DBUG_ASSERT(is_storage_available(tuple - packed_tuple, 1));
+      if (other_tbl_field_is_real_null) {
+        /* NULL value. store '\0' so that it sorts before non-NULL values */
+        *tuple++ = 0;
+        pack = false;
+      } else {
+        /* Not a NULL value. Store '1' */
+        *tuple++ = 1;
+      }
+    }
+
+    if (pack) {
+      Rdb_pack_field_context pack_ctx(nullptr);
+
+      // Set the offset for methods which do not take an offset as an argument
+      DBUG_ASSERT(is_storage_available(tuple - packed_tuple,
+                                      m_pack_info[i].m_max_image_len));
+
+      (this->*m_pack_info[i].m_pack_func)(&m_pack_info[i], other_tbl_field, pack_buffer, &tuple,
+                                      &pack_ctx);
+
+      // WARNING! Don't return without restoring field->ptr and field->null_ptr
+    }
+    // Restore field->ptr and field->null_ptr
+    other_tbl_field->move_field(other_tbl->record[0] + other_tbl_field_offset,
+                      other_tbl_field_maybe_null ? other_tbl->record[0] + other_tbl_field_null_offset : nullptr,
+                      other_tbl_field->null_bit);
+
   }
 
   DBUG_ASSERT(is_storage_available(tuple - packed_tuple, 0));
@@ -3347,6 +3445,17 @@ Rdb_tbl_def::~Rdb_tbl_def() {
   }
 }
 
+bool Rdb_tbl_def::find_key_gl_index_by_name(const std::string& col_name,
+                                           GL_INDEX_ID& gl_index) {
+  for (uint i = 0; i < m_key_count; i++) {
+    if (m_key_descr_arr[i]->get_name() == col_name) {
+      gl_index = m_key_descr_arr[i]->get_gl_index_id();
+      return true;
+    }
+  }
+  return false;
+}
+
 /*
   Put table definition DDL entry. Actual write is done at
   Rdb_dict_manager::commit.
@@ -3851,6 +3960,8 @@ bool Rdb_ddl_manager::init(Rdb_dict_manager *const dict_arg,
   uint max_index_id_in_dict = 0;
   m_dict->get_max_index_id(&max_index_id_in_dict);
 
+  std::vector<Rdb_fk_def> fk_def_vec;
+
   for (it->Seek(ddl_entry_slice); it->Valid(); it->Next()) {
     const uchar *ptr;
     const uchar *ptr_end;
@@ -3923,6 +4034,8 @@ bool Rdb_ddl_manager::init(Rdb_dict_manager *const dict_arg,
                         gl_index_id.cf_id, tdef->full_tablename().c_str());
       }
 
+      m_dict->get_fk_defs(gl_index_id, fk_def_vec);
+
       rocksdb::ColumnFamilyHandle *const cfh =
           cf_manager->get_cf(gl_index_id.cf_id);
       DBUG_ASSERT(cfh != nullptr);
@@ -3949,6 +4062,24 @@ bool Rdb_ddl_manager::init(Rdb_dict_manager *const dict_arg,
     }
     put(tdef);
     i++;
+  }
+
+  for (auto &fk_def : fk_def_vec) {
+    auto foreign_tbl_it = m_index_num_to_keydef.find(fk_def.m_foreign_gl_index_id);
+
+    DBUG_ASSERT(foreign_tbl_it != m_index_num_to_keydef.end());
+    const std::string& foreign_table_name = foreign_tbl_it->second.first;
+    auto foreign_tdef = find(foreign_table_name, false);
+    DBUG_ASSERT(foreign_tdef != nullptr);
+    foreign_tdef->m_foreign_descr_set.insert(fk_def);
+
+    auto referenced_tbl_it = m_index_num_to_keydef.find(fk_def.m_referenced_gl_index_id);
+
+    DBUG_ASSERT(referenced_tbl_it != m_index_num_to_keydef.end());
+    const std::string& referenced_table_name = referenced_tbl_it->second.first;
+    auto referenced_tdef = find(referenced_table_name, false);
+    DBUG_ASSERT(referenced_tdef != nullptr);
+    referenced_tdef->m_referenced_descr_set.insert(fk_def);
   }
 
   /*
@@ -4219,6 +4350,14 @@ void Rdb_ddl_manager::remove(Rdb_tbl_def *const tbl,
   if (lock)
     mysql_rwlock_unlock(&m_rwlock);
 }
+bool Rdb_ddl_manager::is_tmp_table(const std::string &name){
+  std::size_t found = name.find("#sql");
+  if(found != std::string::npos) {
+    return true;
+  }
+  return false;
+}
+
 
 bool Rdb_ddl_manager::rename(const std::string &from, const std::string &to,
                              rocksdb::WriteBatch *const batch) {
@@ -4227,19 +4366,43 @@ bool Rdb_ddl_manager::rename(const std::string &from, const std::string &to,
   bool res = true;
   uchar new_buf[FN_LEN * 2 + Rdb_key_def::INDEX_NUMBER_SIZE];
   uint new_pos = 0;
-
+  auto ddl_manager = rdb_get_ddl_manager();
   mysql_rwlock_wrlock(&m_rwlock);
   if (!(rec = find(from, false))) {
     mysql_rwlock_unlock(&m_rwlock);
     return true;
   }
 
+  bool to_is_tmp = is_tmp_table(to);
   new_rec = new Rdb_tbl_def(to);
+  std::set<std::string> fk_id_set;
+  //if "to" table is temp, means "from" table might has drop_fk_set
+  if (to_is_tmp) {
+    if (!new_rec->drop_fk_set.empty()) {
+      Rdb_fk_set fk_set = rec->m_foreign_descr_set;
+      for (auto it = rec->drop_fk_set.begin(); it != rec->drop_fk_set.end(); ++it) {
+        std::string id = *it;
+        for (auto iter = fk_set.begin(); iter != fk_set.end(); ++iter) {
+          Rdb_fk_def cur_fk = *iter;
+          if (cur_fk.id == id) {
+            //delete it from rec table in ddl;
+            fk_set.erase(cur_fk);
+            std::string referenced_table_name = ddl_manager->safe_get_table_name(iter->m_referenced_gl_index_id);
+            auto referenced_table = ddl_manager->find(referenced_table_name);
+            DBUG_ASSERT(referencesd_table != nullptr);
+            referenced_table->m_referenced_descr_set.erase(cur_fk);
+          }
+        }
+      }
+    }
+  }
 
   new_rec->m_key_count = rec->m_key_count;
   new_rec->m_auto_incr_val =
       rec->m_auto_incr_val.load(std::memory_order_relaxed);
   new_rec->m_key_descr_arr = rec->m_key_descr_arr;
+  new_rec->m_foreign_descr_set = rec->m_foreign_descr_set;
+  new_rec->m_referenced_descr_set = rec->m_referenced_descr_set;
 
   // so that it's not free'd when deleting the old rec
   rec->m_key_descr_arr = nullptr;
@@ -4786,6 +4949,147 @@ bool Rdb_dict_manager::get_index_info(
   }
 
   return found;
+}
+
+void Rdb_dict_manager::put_fk_def(
+    rocksdb::WriteBatch *const batch,
+    const GL_INDEX_ID &foreign_gl_index_id,
+    const GL_INDEX_ID &referenced_gl_index_id,
+    const uint32_t &type,
+    const std::string &id) {
+
+  std::string temp = id.c_str();
+  uchar key_buf[Rdb_key_def::INDEX_NUMBER_SIZE * 3] = {0};
+  uchar value_buf[Rdb_key_def::INDEX_NUMBER_SIZE * 3 + id.length()] = {0};
+  rdb_netbuf_store_uint32(key_buf, Rdb_key_def::FK_DEFINITION);
+  rdb_netbuf_store_uint32(key_buf + Rdb_key_def::INDEX_NUMBER_SIZE, foreign_gl_index_id.cf_id);
+  rdb_netbuf_store_uint32(key_buf + 2 * Rdb_key_def::INDEX_NUMBER_SIZE, foreign_gl_index_id.index_id);
+  const rocksdb::Slice key = rocksdb::Slice((char *)key_buf, sizeof(key_buf));
+
+  rdb_netbuf_store_uint32(value_buf, referenced_gl_index_id.cf_id);
+  rdb_netbuf_store_uint32(value_buf + Rdb_key_def::INDEX_NUMBER_SIZE, referenced_gl_index_id.index_id);
+  rdb_netbuf_store_uint32(value_buf + 2 * Rdb_key_def::INDEX_NUMBER_SIZE, type);
+  unsigned char * ptr = value_buf + 3 * Rdb_key_def::INDEX_NUMBER_SIZE;
+  unsigned char * val = new unsigned char[temp.length()];
+  strcpy((char *) val, temp.c_str());
+  for (uint i = 0; i < temp.length(); i++, ptr++) {
+    rdb_netbuf_store_byte(ptr, val[i]);
+  }
+  const rocksdb::Slice value =
+      rocksdb::Slice((char *)value_buf, sizeof(value_buf));
+  batch->Put(m_system_cfh, key, value);
+}
+
+void Rdb_dict_manager::get_fk_defs(
+    const GL_INDEX_ID &gl_index_id,
+    struct std::vector<Rdb_fk_def> &fk_def_vec) const {
+
+  uchar key_buf[Rdb_key_def::INDEX_NUMBER_SIZE * 3] = {0};
+  dump_index_id(key_buf, Rdb_key_def::FK_DEFINITION, gl_index_id);
+  const rocksdb::Slice &index_slice = rocksdb::Slice((char *)key_buf, sizeof(key_buf));
+
+  rocksdb::Iterator *it = new_iterator();
+  for (it->Seek(index_slice); it->Valid(); it->Next()) {
+    const rocksdb::Slice key = it->key();
+    const rocksdb::Slice val = it->value();
+
+    const uchar * ptr = (const uchar *)key.data();
+
+    Rdb_fk_def fk_def;
+    fk_def.m_foreign_gl_index_id.cf_id =
+        rdb_netbuf_to_uint32(ptr + Rdb_key_def::INDEX_NUMBER_SIZE);
+    fk_def.m_foreign_gl_index_id.index_id =
+        rdb_netbuf_to_uint32(ptr + 2 * Rdb_key_def::INDEX_NUMBER_SIZE);
+    if (fk_def.m_foreign_gl_index_id != gl_index_id) {
+      break;
+    }
+    ptr = (const uchar *)val.data();
+    fk_def.m_referenced_gl_index_id.cf_id = rdb_netbuf_to_uint32(ptr);
+    fk_def.m_referenced_gl_index_id.index_id =
+        rdb_netbuf_to_uint32(ptr + Rdb_key_def::INDEX_NUMBER_SIZE);
+    fk_def.m_type =
+        rdb_netbuf_to_uint32(ptr + 2 * Rdb_key_def::INDEX_NUMBER_SIZE);
+    int length = val.size() - 3 * Rdb_key_def::INDEX_NUMBER_SIZE;
+    ptr = ptr + 3 * Rdb_key_def::INDEX_NUMBER_SIZE;
+    unsigned char id_char[length];
+    for(int i = 0; i < length; i++, ptr++){
+      unsigned char cur = rdb_netbuf_to_byte(ptr);
+      id_char[i] = cur;
+    }
+    std::string id_str(reinterpret_cast<char*>(id_char), length);
+    fk_def.id = id_str;
+    fk_def_vec.push_back(fk_def);
+  }
+  delete it;
+}
+
+void Rdb_dict_manager::delete_fk_def(rocksdb::WriteBatch *const batch, 
+    const GL_INDEX_ID &gl_index_id) {
+  delete_with_prefix(batch, Rdb_key_def::FK_DEFINITION, gl_index_id);
+}
+
+void Rdb_dict_manager::put_fk_set(rocksdb::WriteBatch *const batch,
+                                  struct Rdb_fk_def &fk_def) const {
+  uchar key_buf[Rdb_key_def::INDEX_NUMBER_SIZE + fk_def.id.length()] = {0};
+  uchar value_buf[Rdb_key_def::INDEX_NUMBER_SIZE * 5] = {0};
+  rdb_netbuf_store_uint32(key_buf, Rdb_key_def::FK_SET);
+  uchar *ptr = key_buf + Rdb_key_def::INDEX_NUMBER_SIZE;
+  std::string temp = fk_def.id.c_str();
+  unsigned char *val = new unsigned char[temp.length()];
+  strcpy((char *)val, temp.c_str());
+  for (uint i = 0; i < temp.length(); i++, ptr++) {
+    rdb_netbuf_store_byte(ptr, val[i]);
+  }
+
+  const rocksdb::Slice key = rocksdb::Slice((char *)key_buf, sizeof(key_buf));
+  rdb_netbuf_store_uint32(value_buf, fk_def.m_type);
+  rdb_netbuf_store_uint32(value_buf + Rdb_key_def::INDEX_NUMBER_SIZE,
+                          fk_def.m_foreign_gl_index_id.cf_id);
+  rdb_netbuf_store_uint32(value_buf + 2 * Rdb_key_def::INDEX_NUMBER_SIZE,
+                          fk_def.m_foreign_gl_index_id.index_id);
+  rdb_netbuf_store_uint32(value_buf + 3 * Rdb_key_def::INDEX_NUMBER_SIZE,
+                          fk_def.m_referenced_gl_index_id.cf_id);
+  rdb_netbuf_store_uint32(value_buf + 4 * Rdb_key_def::INDEX_NUMBER_SIZE,
+                          fk_def.m_referenced_gl_index_id.index_id);
+  const rocksdb::Slice value =
+      rocksdb::Slice((char *)value_buf, sizeof(value_buf));
+  batch->Put(m_system_cfh, key, value);
+}
+
+bool Rdb_dict_manager::get_fk_id(const std::string &fk_id) const {
+  bool found = false;
+  uchar key_buf[Rdb_key_def::INDEX_NUMBER_SIZE + fk_id.length()] = {0};
+  rdb_netbuf_store_uint32(key_buf, Rdb_key_def::FK_SET);
+  uchar *ptr = key_buf + Rdb_key_def::INDEX_NUMBER_SIZE;
+  std::string temp = fk_id;
+  unsigned char *val = new unsigned char[temp.length()];
+  strcpy((char *)val, temp.c_str());
+  for (uint i = 0; i < temp.length(); i++, ptr++) {
+    rdb_netbuf_store_byte(ptr, val[i]);
+  }
+  const rocksdb::Slice &key = rocksdb::Slice((char *)key_buf, sizeof(key_buf));
+  std::string value;
+  const rocksdb::Status &status = get_value(key, &value);
+  if (status.ok()) {
+    found = true;
+  }
+  return found;
+}
+
+void Rdb_dict_manager::delete_fk_in_set(rocksdb::WriteBatch *const batch,
+                                  const std::string &fk_id) const {
+  
+  uchar key_buf[Rdb_key_def::INDEX_NUMBER_SIZE + fk_id.length()] = {0};
+  rdb_netbuf_store_uint32(key_buf, Rdb_key_def::FK_SET);
+  uchar *ptr = key_buf + Rdb_key_def::INDEX_NUMBER_SIZE;
+  std::string temp = fk_id;
+  unsigned char *val = new unsigned char[temp.length()];
+  strcpy((char *)val, temp.c_str());
+  for (uint i = 0; i < temp.length(); i++, ptr++) {
+    rdb_netbuf_store_byte(ptr, val[i]);
+  }
+  const rocksdb::Slice &key = rocksdb::Slice((char *)key_buf, sizeof(key_buf));
+  delete_key(batch, key);
 }
 
 bool Rdb_dict_manager::get_cf_flags(const uint32_t &cf_id,

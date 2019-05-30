@@ -204,6 +204,11 @@ public:
   /* Pack the hidden primary key into mem-comparable form. */
   uint pack_hidden_pk(const longlong &hidden_pk_id,
                       uchar *const packed_tuple) const;
+  /* 2018/07/03 Quan Zhang Convert a key from record format in other table to the key as mem-comparable form. */
+  uint pack_key_from_other_table(const TABLE *const other_tbl, const TABLE *const my_tbl,
+                   const Rdb_key_def& other_tbl_key_def,
+                   uchar *const pack_buffer, const uchar *const record,
+                   uchar *const packed_tuple) const;
   int unpack_field(Rdb_field_packing *const fpi,
                    Field *const             field,
                    Rdb_string_reader*       reader,
@@ -406,6 +411,8 @@ public:
     MAX_INDEX_ID = 7,
     DDL_CREATE_INDEX_ONGOING = 8,
     AUTO_INC = 9,
+    FK_DEFINITION = 10, // 2018/06/11 Quan Zhang add FK data dictionary type
+    FK_SET = 11,
     END_DICT_INDEX_ID = 255
   };
 
@@ -656,6 +663,8 @@ public:
   int skip_variable_space_pad(const Rdb_field_packing *const fpi,
                               const Field *const field,
                               Rdb_string_reader *const reader) const;
+
+  Rdb_field_packing* get_field_packing() const { return m_pack_info; }
 
   inline bool use_legacy_varbinary_format() const {
     return !index_format_min_check(PRIMARY_FORMAT_VERSION_UPDATE2,
@@ -964,6 +973,37 @@ inline bool Rdb_key_def::has_unpack_info(const uint &kp) const {
   return m_pack_info[kp].uses_unpack_info();
 }
 
+// 2018/06/07 Quan Zhang A foreign key definition
+struct Rdb_fk_def {
+  /* foreign key unique id*/
+  std::string id;
+  /* foreign index */
+  GL_INDEX_ID m_foreign_gl_index_id;
+  /* referenced index*/
+  GL_INDEX_ID m_referenced_gl_index_id;
+  uint32_t m_type;
+};
+
+struct Rdb_fk_compare {
+  bool operator()(const Rdb_fk_def &lhs, const Rdb_fk_def &rhs) const {
+    if (lhs.m_foreign_gl_index_id.cf_id == rhs.m_foreign_gl_index_id.cf_id)
+    {
+      if (lhs.m_foreign_gl_index_id.index_id == rhs.m_foreign_gl_index_id.index_id)
+      {
+        if (lhs.m_referenced_gl_index_id.cf_id == rhs.m_referenced_gl_index_id.cf_id)
+        {
+          return (lhs.m_referenced_gl_index_id.index_id < rhs.m_referenced_gl_index_id.index_id);
+        }
+        return (lhs.m_referenced_gl_index_id.cf_id < rhs.m_referenced_gl_index_id.cf_id);
+      }
+      return (lhs.m_foreign_gl_index_id.index_id < rhs.m_foreign_gl_index_id.index_id);
+    }
+    return (lhs.m_foreign_gl_index_id.cf_id < rhs.m_foreign_gl_index_id.cf_id);
+  }
+};
+
+typedef std::set<Rdb_fk_def, Rdb_fk_compare> Rdb_fk_set;
+
 /*
   A table definition. This is an entry in the mapping
 
@@ -1013,6 +1053,21 @@ public:
 
   /* Array of index descriptors */
   std::shared_ptr<Rdb_key_def> *m_key_descr_arr;
+
+  bool find_key_gl_index_by_name(const std::string& col_name,
+                                GL_INDEX_ID& gl_index);
+
+  // 2018/06/11 Quan Zhang Set of foreign key constraints in the table;
+  // these refer to columns in other tables;
+  Rdb_fk_set m_foreign_descr_set;
+  //2018.11.6
+  const Rdb_fk_set &rdb_fk_set() const {return m_foreign_descr_set;}
+
+  // 2018/06/11 Quan Zhang Set of foreign key costraints which refer to
+  // this table
+  Rdb_fk_set m_referenced_descr_set;
+  //2018/12/06 drop foreign key based on constraint name
+  std::set<std::string> drop_fk_set;
 
   std::atomic<longlong> m_hidden_pk_val;
   std::atomic<ulonglong> m_auto_incr_val;
@@ -1109,10 +1164,12 @@ public:
   /* Modify the mapping and write it to on-disk storage */
   int put_and_write(Rdb_tbl_def *const key_descr,
                     rocksdb::WriteBatch *const batch);
+
   void remove(Rdb_tbl_def *const rec, rocksdb::WriteBatch *const batch,
               const bool &lock = true);
   bool rename(const std::string &from, const std::string &to,
               rocksdb::WriteBatch *const batch);
+  bool is_tmp_table(const std::string &name);
 
   uint get_and_update_next_number(Rdb_dict_manager *const dict) {
     return m_sequence.get_and_update_next_number(dict);
@@ -1241,6 +1298,14 @@ private:
   value: version, {max auto_increment so far}
   max auto_increment is 8 bytes
 
+  10. foreign key entry
+  key: Rdb_key_def::FK_DEFINITION(0x10) + cf_id (which table) + index_id
+  value: referened_cf_id (which table), referened_index_id, type, unique id;
+
+  11. foreign key set
+  key: Rdb_key_def::FK_SET(0X11)
+  value: fk_id
+
   Data dictionary operations are atomic inside RocksDB. For example,
   when creating a table with two indexes, it is necessary to call Put
   three times. They have to be atomic. Rdb_dict_manager has a wrapper function
@@ -1308,6 +1373,23 @@ public:
                          const GL_INDEX_ID &index_id) const;
   bool get_index_info(const GL_INDEX_ID &gl_index_id,
                       struct Rdb_index_info *const index_info) const;
+
+  /* 2018/06/11 Quan Zhang FK Index => RF Index */
+  void put_fk_def(rocksdb::WriteBatch *const batch, const GL_INDEX_ID &foreign_gl_index_id,
+                                    const GL_INDEX_ID &referenced_gl_index_id,
+                                    const uint32_t &type, const std::string &id);
+  void get_fk_defs(const GL_INDEX_ID &gl_index_id,
+                   struct std::vector<Rdb_fk_def> &fk_def_vec) const;
+  void delete_fk_def(rocksdb::WriteBatch *const batch,
+                     const GL_INDEX_ID &gl_index_id);
+  /* 2018/11/26 Ran Ju FK id set */
+  void put_fk_set(rocksdb::WriteBatch *const batch,
+                  struct Rdb_fk_def &fk_def) const;
+  bool get_fk_id(const std::string &fk_id) const;
+
+  bool get_all_fk_defs(const std::string &fk_id, std::set<Rdb_fk_def> &fk_set) const;
+  void delete_fk_in_set(rocksdb::WriteBatch *const batch,
+                  const std::string &fk_id) const;
 
   /* CF id => CF flags */
   void add_cf_flags(rocksdb::WriteBatch *const batch, const uint &cf_id,

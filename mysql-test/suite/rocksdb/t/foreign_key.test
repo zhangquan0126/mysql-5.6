@@ -6,9 +6,35 @@ DROP TABLE IF EXISTS t1, t2;
 
 CREATE TABLE t1 (b INT PRIMARY KEY);
 
-# Try simple foreign key - should fail
---error ER_NOT_SUPPORTED_YET
+# Try simple foreign key - should succeed as it is being supported in myrocks
 CREATE TABLE t2 (a INT NOT NULL, b INT NOT NULL, FOREIGN KEY (b) REFERENCES t1(b));
+INSERT INTO t1 (b) VALUES (100),(200),(300);
+INSERT INTO t2 (a,b) VALUES (1,100),(2,200),(3,300);
+# Insert a row in the foreign table which does not have parent row should fail
+--error ER_NO_REFERENCED_ROW_2
+INSERT INTO t2 (a,b) VALUES (4,400);
+# Update a row in the foreign table which does have parent row should succeed
+UPDATE t2 SET b=100 WHERE a=2;
+# Update a row in the foreign table which does not have parent row should fail
+--error ER_NO_REFERENCED_ROW_2
+UPDATE t2 SET b=500 WHERE a=2;
+# Update a row in the referenced table which has child row should fail as the constraint is no action
+--error ER_ROW_IS_REFERENCED_2
+UPDATE t1 SET b=400 WHERE b=300;
+# Delete a row in the referenced table which has child row should fail as the constraint is no action
+--error ER_ROW_IS_REFERENCED_2
+DELETE FROM t1 WHERE b=100;
+--sorted_result
+SELECT * from t1;
+--sorted_result
+SELECT * from t2;
+# Truncate t1 should fail before dropping t2
+--error ER_TRUNCATE_ILLEGAL_FK
+TRUNCATE TABLE t1;
+# Drop t1 should also fail before dropping t2
+--error ER_ROW_IS_REFERENCED
+DROP TABLE t1;
+DROP TABLE t2;
 
 # Try simple valid syntax with 'foreign' as part - should succeed
 CREATE TABLE t2 (a INT NOT NULL, bforeign INT NOT NULL);
@@ -18,13 +44,12 @@ DROP TABLE t2;
 CREATE TABLE t2 (a INT NOT NULL, foreignkey INT NOT NULL);
 DROP TABLE t2;
 
-# Try with valid id containing 'foreign' and then a foreign key - should fail
---error ER_NOT_SUPPORTED_YET
-CREATE TABLE t2 (a INT NOT NULL, bforeign INT not null, FOREIGN KEY (bforeign) REFERENCES t1(b));
+# Try with valid id containing 'foreign' and then a foreign key - should succeed
+#CREATE TABLE t2 (a INT NOT NULL, bforeign INT not null, FOREIGN KEY (bforeign) REFERENCES t1(b));
+#DROP TABLE t2;
 
 CREATE TABLE t2 (a INT NOT NULL, b INT NOT NULL);
-# Alter with foreign key - should fail
---error ER_NOT_SUPPORTED_YET
+# Alter with foreign key - should succeed
 ALTER TABLE t2 ADD FOREIGN KEY (b) REFERENCES t1(b);
 DROP TABLE t2;
 
@@ -38,10 +63,30 @@ CREATE TABLE t2 (a INT NOT NULL);
 ALTER TABLE t2 ADD foreignkey INT NOT NULL;
 DROP TABLE t2;
 
-# Alter with valid syntax that contains 'foreign' and then foreign key - should fail
+# Alter with valid syntax that contains 'foreign' and then foreign key - should succeed
+TRUNCATE TABLE t1;
+INSERT INTO t1 (b) VALUES (100),(200),(300);
 CREATE TABLE t2 (a INT NOT NULL);
---error ER_NOT_SUPPORTED_YET
-ALTER TABLE t2 ADD bforeign INT NOT NULL, ADD FOREIGN KEY (bforeign) REFERENCES t1(b);
+ALTER TABLE t2 ADD b INT NOT NULL, ADD FOREIGN KEY (b) REFERENCES t1(b);
+INSERT INTO t2 (a,b) VALUES (1,100),(2,200),(3,300);
+# Insert a row in the foreign table which does not have parent row should fail
+--error ER_NO_REFERENCED_ROW_2
+INSERT INTO t2 (a,b) VALUES (4,400);
+# Update a row in the foreign table which does have parent row should succeed
+UPDATE t2 SET b=100 WHERE a=2;
+# Update a row in the foreign table which does not have parent row should fail
+--error ER_NO_REFERENCED_ROW_2
+UPDATE t2 SET b=500 WHERE a=2;
+# Update a row in the referenced table which has child row should fail as the constraint is no action
+--error ER_ROW_IS_REFERENCED_2
+UPDATE t1 SET b=400 WHERE b=300;
+# Delete a row in the referenced table which has child row should fail as the constraint is no action
+--error ER_ROW_IS_REFERENCED_2
+DELETE FROM t1 WHERE b=100;
+--sorted_result
+SELECT * from t1;
+--sorted_result
+SELECT * from t2;
 DROP TABLE t2;
 
 DROP TABLE t1;
